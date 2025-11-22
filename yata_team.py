@@ -160,6 +160,63 @@ print("\nDone! MIDI files:")
 for p in midi_paths:
     print(" -", p.name)
 
+import pretty_midi
+
+def first_note_time(pm: pretty_midi.PrettyMIDI, min_dur=0.03):
+    """
+    Earliest onset among 'real' notes.
+    min_dur filters tiny spurious notes (seconds).
+    """
+    starts = []
+    for inst in pm.instruments:
+        for n in inst.notes:
+            if (n.end - n.start) >= min_dur:
+                starts.append(n.start)
+
+    # fallback: if everything was too short, take any note
+    if not starts:
+        for inst in pm.instruments:
+            for n in inst.notes:
+                starts.append(n.start)
+
+    if not starts:
+        raise ValueError("No notes found in MIDI.")
+    return float(min(starts))
+
+
+def shift_pretty_midi(pm: pretty_midi.PrettyMIDI, shift: float):
+    """
+    Shift ALL time-based events by -shift seconds and clamp to >= 0.
+    """
+    for inst in pm.instruments:
+        # notes
+        for n in inst.notes:
+            n.start = max(0.0, n.start - shift)
+            n.end   = max(0.0, n.end   - shift)
+
+        # pitch bends
+        for pb in inst.pitch_bends:
+            pb.time = max(0.0, pb.time - shift)
+
+        # control changes (e.g., sustain)
+        for cc in inst.control_changes:
+            cc.time = max(0.0, cc.time - shift)
+
+    return pm
+
+
+print("\nAligning first note of each MIDI to t=0...")
+
+for mid_path in midi_paths:
+    pm = pretty_midi.PrettyMIDI(str(mid_path))
+    t0 = first_note_time(pm)
+    pm_aligned = shift_pretty_midi(pm, t0)
+
+    # overwrite so downstream zip/download uses aligned versions
+    pm_aligned.write(str(mid_path))
+
+    print(f" - {mid_path.name}: first note was at {t0:.3f}s → aligned")
+
 zip_path = Path("/content/violin_midis.zip")
 with zipfile.ZipFile(zip_path, "w") as zf:
     for mp in midi_paths:
@@ -167,3 +224,301 @@ with zipfile.ZipFile(zip_path, "w") as zf:
 
 print("Created:", zip_path.name)
 files.download(str(zip_path))
+
+import pretty_midi
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from google.colab import files
+from unidecode import unidecode
+
+# -----------------------------
+# STEP 0: Get two aligned MIDI paths
+# -----------------------------
+def get_two_midi_paths():
+    if "midi_paths" in globals() and len(midi_paths) >= 2:
+        print("Using last two MIDI files from midi_paths:")
+        print(" A =", midi_paths[-2].name)
+        print(" B =", midi_paths[-1].name)
+        return [midi_paths[-2], midi_paths[-1]]
+
+    print("Upload EXACTLY two aligned MIDI files (.mid):")
+    uploaded = files.upload()
+    assert len(uploaded) == 2, "Please upload exactly two MIDI files."
+
+    pair_dir = Path("/content/midi_pair")
+    pair_dir.mkdir(exist_ok=True)
+
+    midi_pair = []
+    for fn, data in uploaded.items():
+        safe_fn = unidecode(fn)
+        p = pair_dir / safe_fn
+        with open(p, "wb") as f:
+            f.write(data)
+        midi_pair.append(p)
+
+    return midi_pair
+
+midi_A_path, midi_B_path = get_two_midi_paths()
+
+# -----------------------------
+# TOLERANCES
+# -----------------------------
+# loose pairing AFTER warping (more tolerant)
+match_time_tol = 0.20   # sec  (was 0.12)
+match_pitch_tol = 0.5   # semitones (keep)
+
+# "way off" thresholds
+sig_onset_tol  = 0.45   # sec  (was 0.25)  -> ignores small early/late
+sig_pitch_tol  = 1.0    # semitones
+
+# offsets are often noisy; be forgiving
+sig_offset_tol = 1.20   # sec  (new) only flag if REALLY off
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def extract_notes(pm: pretty_midi.PrettyMIDI, min_dur=min_note_dur):
+    notes = []
+    for inst in pm.instruments:
+        for n in inst.notes:
+            if (n.end - n.start) >= min_dur:
+                notes.append({
+                    "start": float(n.start),
+                    "end": float(n.end),
+                    "pitch": int(n.pitch),
+                    "velocity": int(n.velocity),
+                })
+    notes.sort(key=lambda x: x["start"])
+    return notes
+
+
+def dtw_path(seqA, seqB):
+    """Simple DTW on pitch sequences. cost = |pitch diff|."""
+    n, m = len(seqA), len(seqB)
+    D = np.full((n+1, m+1), np.inf)
+    D[0, 0] = 0.0
+
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            cost = abs(seqA[i-1] - seqB[j-1])
+            D[i, j] = cost + min(D[i-1, j], D[i, j-1], D[i-1, j-1])
+
+    # backtrack
+    i, j = n, m
+    path = []
+    while i > 0 and j > 0:
+        path.append((i-1, j-1))
+        step = np.argmin([D[i-1, j], D[i, j-1], D[i-1, j-1]])
+        if step == 0:
+            i -= 1
+        elif step == 1:
+            j -= 1
+        else:
+            i -= 1
+            j -= 1
+
+    return path[::-1]
+
+
+def build_time_warp(notesA, notesB):
+    """
+    Use DTW on pitch sequences to build a piecewise-linear warp mapping B-time -> A-time.
+    """
+    pitchA = [n["pitch"] for n in notesA]
+    pitchB = [n["pitch"] for n in notesB]
+
+    path = dtw_path(pitchA, pitchB)
+
+    # compress path to one B index per A index (median)
+    mapping = {}
+    for i, j in path:
+        mapping.setdefault(i, []).append(j)
+
+    pairs = []
+    for i, js in mapping.items():
+        j_med = int(np.median(js))
+        pairs.append((i, j_med))
+
+    # sort by A time
+    pairs.sort(key=lambda ij: notesA[ij[0]]["start"])
+
+    tA = []
+    tB = []
+    last_tb = -1
+    for i, j in pairs:
+        ta = notesA[i]["start"]
+        tb = notesB[j]["start"]
+        if tb > last_tb:   # enforce monotonic B-time
+            tA.append(ta)
+            tB.append(tb)
+            last_tb = tb
+
+    tA = np.array(tA)
+    tB = np.array(tB)
+
+    if len(tA) < 2:
+        raise RuntimeError("DTW warp failed: too few alignment anchors.")
+
+    def warp_time(tb):
+        # interpolate, clamped to ends
+        return float(np.interp(tb, tB, tA))
+
+    return warp_time
+
+
+def warp_notes(notesB, warp_time_fn):
+    warped = []
+    for n in notesB:
+        warped.append({
+            **n,
+            "start": warp_time_fn(n["start"]),
+            "end": warp_time_fn(n["end"]),
+        })
+    warped.sort(key=lambda x: x["start"])
+    return warped
+
+
+def greedy_match(notesA, notesB, t_tol=match_time_tol, p_tol=match_pitch_tol):
+    usedB = np.zeros(len(notesB), dtype=bool)
+    matches, missingA = [], []
+
+    for i, a in enumerate(notesA):
+        candidates = []
+        for j, b in enumerate(notesB):
+            if usedB[j]:
+                continue
+            dt = abs(b["start"] - a["start"])
+            dp = abs(b["pitch"] - a["pitch"])
+            if dt <= t_tol and dp <= p_tol:
+                candidates.append((dt + 0.05*dp, j, dt, dp))
+
+        if not candidates:
+            missingA.append(i)
+            continue
+
+        candidates.sort(key=lambda x: x[0])
+        _, jbest, dtbest, dpbest = candidates[0]
+        usedB[jbest] = True
+        matches.append((i, jbest, dtbest, dpbest))
+
+    extraB = [j for j in range(len(notesB)) if not usedB[j]]
+    return matches, missingA, extraB
+
+
+def classify_significant(matches, notesA, notesB):
+    sig, ok = [], []
+    for i, j, dt_onset, dp in matches:
+        a, b = notesA[i], notesB[j]
+        dt_offset = abs(b["end"] - a["end"])
+
+        # significant if pitch way off OR onset way off OR offset *very* way off
+        is_sig = (dp >= sig_pitch_tol) or (dt_onset >= sig_onset_tol) or (dt_offset >= sig_offset_tol)
+
+        rec = {
+            "A_index": i, "B_index": j,
+            "A_start": a["start"], "B_start": b["start"],
+            "A_end": a["end"], "B_end": b["end"],
+            "A_pitch": a["pitch"], "B_pitch": b["pitch"],
+            "pitch_diff_semitones": dp,
+            "onset_diff_sec": dt_onset,
+            "offset_diff_sec": dt_offset,
+            "type": (
+                "pitch_off" if dp >= sig_pitch_tol else
+                "timing_off" if dt_onset >= sig_onset_tol else
+                "duration_off" if dt_offset >= sig_offset_tol else
+                "ok"
+            )
+        }
+
+        (sig if is_sig else ok).append(rec)
+
+    return sig, ok
+
+
+def plot_side_by_side(notesA, notesB, sig_matches, missingA, extraB, titleA, titleB):
+    sigA_idx = set([r["A_index"] for r in sig_matches]) | set(missingA)
+    sigB_idx = set([r["B_index"] for r in sig_matches]) | set(extraB)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+
+    def draw(ax, notes, sig_idx, title):
+        for k, n in enumerate(notes):
+            color = "red" if k in sig_idx else "gray"
+            ax.plot([n["start"], n["end"]], [n["pitch"], n["pitch"]],
+                    linewidth=3, alpha=0.9, color=color)
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("MIDI Pitch")
+        ax.grid(True, alpha=0.2)
+
+    draw(axes[0], notesA, sigA_idx, titleA)
+    draw(axes[1], notesB, sigB_idx, titleB)
+
+    import matplotlib.lines as mlines
+    ok_line  = mlines.Line2D([], [], color='gray', linewidth=3, label='Matched / OK')
+    sig_line = mlines.Line2D([], [], color='red', linewidth=3, label='Significant error')
+    fig.legend(handles=[ok_line, sig_line], loc="upper center", ncol=2)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# -----------------------------
+# RUN
+# -----------------------------
+pmA = pretty_midi.PrettyMIDI(str(midi_A_path))
+pmB = pretty_midi.PrettyMIDI(str(midi_B_path))
+
+notesA = extract_notes(pmA)
+notesB = extract_notes(pmB)
+
+print("\nBuilding DTW time warp (handles tempo drift)...")
+warp_fn = build_time_warp(notesA, notesB)
+
+notesB_warped = warp_notes(notesB, warp_fn)
+
+matches, missingA, extraB = greedy_match(notesA, notesB_warped)
+sig_matches, ok_matches = classify_significant(matches, notesA, notesB_warped)
+
+print(f"\nTotal notes A: {len(notesA)}")
+print(f"Total notes B: {len(notesB)}")
+print(f"Matched pairs after warp: {len(matches)}")
+print(f"Missing in B after warp:  {len(missingA)}")
+print(f"Extra in B after warp:    {len(extraB)}")
+print(f"Significant matched errors: {len(sig_matches)}")
+
+# report
+rows = []
+for i in missingA:
+    a = notesA[i]
+    rows.append({"type":"missing_note", "time_sec":a["start"], "A_pitch":a["pitch"], "B_pitch":None})
+
+for j in extraB:
+    b = notesB_warped[j]
+    rows.append({"type":"extra_note", "time_sec":b["start"], "A_pitch":None, "B_pitch":b["pitch"]})
+
+for r in sig_matches:
+    rows.append({
+        "type": r["type"],
+        "time_sec": r["A_start"],
+        "A_pitch": r["A_pitch"],
+        "B_pitch": r["B_pitch"],
+        "pitch_diff_semitones": r["pitch_diff_semitones"],
+        "onset_diff_sec": r["onset_diff_sec"],
+        "offset_diff_sec": r["offset_diff_sec"]
+    })
+
+report_df = pd.DataFrame(rows).sort_values("time_sec").reset_index(drop=True)
+
+print("\n=== Significant Errors Report (after DTW warp) ===")
+display(report_df)
+
+# viz
+plot_side_by_side(
+    notesA, notesB_warped,
+    sig_matches, missingA, extraB,
+    titleA=Path(midi_A_path).name + " (ref)",
+    titleB=Path(midi_B_path).name + " (warped-to-ref)"
+)
