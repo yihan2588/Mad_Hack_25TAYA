@@ -20,7 +20,7 @@ const ViolonApp = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
 
-  const API_URL = "http://localhost:8000";
+  const API_URL = "http://127.0.0.1:8000";
 
   const handleUserFileChange = (e) => {
     const file = e.target.files[0];
@@ -49,7 +49,7 @@ const ViolonApp = () => {
       });
 
       if (!response.ok) {
-        throw new Error("Analysis failed. Please try again.");
+        throw new Error("Analysis failed");
       }
 
       const result = await response.json();
@@ -78,7 +78,7 @@ const ViolonApp = () => {
       setAccuracyRegions(regions);
     } catch (err) {
       console.error(err);
-      setError(err.message);
+      setError("Failed to connect to the analysis engine.");
     } finally {
       setIsLoading(false);
     }

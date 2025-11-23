@@ -1,289 +1,238 @@
+"""FastAPI server exposing the performance analysis pipeline."""
+from __future__ import annotations
+
+import asyncio
+import logging
 import sys
-import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any, Dict, List, Sequence
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import pretty_midi
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-import torch
-import pretty_midi
-import numpy as np
+# Ensure the MUSC repository (if present) is importable before loading the model.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MUSC_REPO = PROJECT_ROOT / "MUSC_violin"
+if MUSC_REPO.exists() and str(MUSC_REPO) not in sys.path:
+    sys.path.append(str(MUSC_REPO))
 
-# --- 1. Setup & Model Loading ---
-# Add the cloned repo to path so imports work
-sys.path.append("MUSC_violin")
-try:
-    from musc.model import PretrainedModel
-except ImportError:
-    PretrainedModel = None
-    print("Warning: MUSC_violin repo not found in path. Ensure it is cloned.")
+from yata_team import (  # noqa: E402
+    ComparisonConfig,
+    MatchEvaluation,
+    NoteError,
+    TranscriptionConfig,
+    align_midi_first_note,
+    compare_performances,
+    convert_to_wav,
+    load_transcription_model,
+    safe_transcribe_local,
+)
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Enable CORS for Frontend communication
+app = FastAPI(title="YATA Performance Analyzer")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production limit this
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global Model Variable
-model = None
-device = "cuda" if torch.cuda.is_available() else "cpu"
+transcription_model: Any | None = None
+transcription_config = TranscriptionConfig()
+comparison_config = ComparisonConfig()
+analysis_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
-def load_model():
-    global model
-    if PretrainedModel is None:
-        print("PretrainedModel unavailable; ensure repo is cloned before serving.")
-        return
-    print(f"Loading model on {device}...")
+def _load_transcriber() -> None:
+    """Load the MUSC model once so audio uploads can be transcribed."""
+
+    global transcription_model
     try:
-        model = PretrainedModel(instrument="violin").to(device)
-        print("Model loaded successfully.")
-    except Exception as e:  # pragma: no cover - depends on GPU availability
-        print(f"Error loading model: {e}")
-
-
-# --- 2. Helper Functions ---
-
-def convert_to_wav(in_path: Path) -> Path:
-    """Convert input audio to 44.1kHz mono wav using ffmpeg."""
-    wav_path = in_path.with_suffix(".wav")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(in_path),
-        "-ac",
-        "1",
-        "-ar",
-        "44100",
-        str(wav_path),
-    ]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return wav_path
+        transcription_model = load_transcription_model()
+        logger.info("Loaded MUSC model for instrument '%s'", "violin")
+    except Exception as exc:  # pragma: no cover - depends on GPU setup
+        transcription_model = None
+        logger.warning("MUSC model unavailable: %s", exc)
+        logger.warning("Audio uploads will be rejected until the model loads correctly.")
 
 
 def transcribe_audio(audio_path: Path) -> pretty_midi.PrettyMIDI:
-    """Transcribe audio file to PrettyMIDI object."""
-    if model is None:
-        raise RuntimeError("Transcription model not loaded")
+    """Transcribe *audio_path* into a PrettyMIDI object using the MUSC model."""
 
-    wav_path = convert_to_wav(audio_path)
+    if transcription_model is None:
+        raise RuntimeError(
+            "The transcription model is not loaded. Ensure MUSC weights are available or "
+            "upload MIDI files instead."
+        )
 
-    if hasattr(model, "transcribe"):
-        out = model.transcribe(str(wav_path), postprocessing="spotify")
-    elif hasattr(model, "transcribe_file"):
-        out = model.transcribe_file(str(wav_path), postprocessing="spotify")
+    wav_path = convert_to_wav(
+        audio_path,
+        sample_rate=transcription_config.target_sample_rate,
+        mono=transcription_config.mono,
+    )
+    midi_obj = safe_transcribe_local(
+        transcription_model,
+        str(wav_path),
+        batch_size=transcription_config.batch_size,
+        postprocessing=transcription_config.postprocessing,
+    )
+    return midi_obj
+
+
+def align_midi_start(midi_path: Path) -> Path:
+    """Align the first significant note of ``midi_path`` to zero."""
+
+    return align_midi_first_note(midi_path, min_note_duration=comparison_config.min_note_duration)
+
+
+async def _save_upload(upload: UploadFile, directory: Path, prefix: str) -> Path:
+    """Persist *upload* inside *directory* and return the stored path."""
+
+    original = Path(upload.filename or prefix)
+    suffix = original.suffix or ""
+    dest = directory / f"{prefix}{suffix}"
+    data = await upload.read()
+    dest.write_bytes(data)
+    return dest
+
+
+def _ensure_midi_file(src_path: Path, role: str) -> Path:
+    """Convert audio uploads to MIDI and align the first onset."""
+
+    suffix = src_path.suffix.lower()
+    if suffix in {".mid", ".midi"}:
+        midi_path = src_path
     else:
-        raise RuntimeError("Could not find transcribe method on model")
+        midi_obj = transcribe_audio(src_path)
+        midi_path = src_path.with_suffix(".mid")
+        midi_obj.write(str(midi_path))
+        logger.info("Transcribed %s audio to MIDI at %s", role, midi_path)
 
-    if isinstance(out, pretty_midi.PrettyMIDI):
-        return out
-    if isinstance(out, dict) and "midi" in out:
-        return out["midi"]
-    return out[0]
-
-
-def align_midi_start(pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
-    """Shift MIDI so the first note starts at 0."""
-    starts = []
-    for inst in pm.instruments:
-        for n in inst.notes:
-            if (n.end - n.start) >= 0.03:
-                starts.append(n.start)
-
-    if not starts:
-        return pm
-
-    t0 = min(starts)
-
-    for inst in pm.instruments:
-        for n in inst.notes:
-            n.start = max(0.0, n.start - t0)
-            n.end = max(0.0, n.end - t0)
-    return pm
+    align_midi_start(midi_path)
+    return midi_path
 
 
-# --- 3. DTW & Comparison Logic ---
-
-def extract_notes(pm, min_dur=0.05):
-    notes = []
-    for inst in pm.instruments:
-        for n in inst.notes:
-            if (n.end - n.start) >= min_dur:
-                notes.append(
-                    {
-                        "start": float(n.start),
-                        "end": float(n.end),
-                        "pitch": int(n.pitch),
-                        "velocity": int(n.velocity),
-                    }
-                )
-    notes.sort(key=lambda x: x["start"])
-    return notes
+def _accuracy_from_evaluation(evaluation: MatchEvaluation) -> str:
+    if evaluation.student_error_type == "ok":
+        return "good"
+    return "poor" if evaluation.is_significant else "moderate"
 
 
-def merge_same_pitch_notes(notes, gap_tol=0.3):
-    if not notes:
-        return notes
-    merged = [notes[0].copy()]
-    for n in notes[1:]:
-        last = merged[-1]
-        gap = n["start"] - last["end"]
-        if n["pitch"] == last["pitch"] and gap <= gap_tol:
-            last["end"] = max(last["end"], n["end"])
-        else:
-            merged.append(n.copy())
-    return merged
+def _chart_data_from_result(result: ComparisonResult) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    for evaluation in result.match_evaluations:
+        ref_note = result.reference_notes[evaluation.reference_index]
+        stud_note = result.student_notes_warped[evaluation.student_index]
+        rows.append(
+            {
+                "time": ref_note.start,
+                "master": ref_note.pitch,
+                "user": stud_note.pitch,
+                "accuracy": _accuracy_from_evaluation(evaluation),
+                "status": evaluation.student_error_type,
+                "pitchDiff": evaluation.pitch_diff_semitones,
+                "onsetDiff": evaluation.onset_diff_sec,
+                "offsetDiff": evaluation.offset_diff_sec,
+            }
+        )
+
+    for idx in result.missing_reference_indices:
+        note = result.reference_notes[idx]
+        rows.append(
+            {
+                "time": note.start,
+                "master": note.pitch,
+                "user": None,
+                "accuracy": "poor",
+                "status": "missed_note",
+            }
+        )
+
+    for idx in result.extra_student_indices:
+        note = result.student_notes_warped[idx]
+        rows.append(
+            {
+                "time": note.start,
+                "master": None,
+                "user": note.pitch,
+                "accuracy": "poor",
+                "status": "extra_note",
+            }
+        )
+
+    rows.sort(key=lambda row: row["time"])
+    return rows
 
 
-def dtw_path_simple(seqA, seqB):
-    """Simple DTW on pitch sequences."""
-    n, m = len(seqA), len(seqB)
-    D = np.full((n + 1, m + 1), np.inf)
-    D[0, 0] = 0.0
+def _stats_from_chart(chart_data: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(chart_data)
+    counts = {"good": 0, "moderate": 0, "poor": 0}
+    for row in chart_data:
+        counts[row["accuracy"]] = counts.get(row["accuracy"], 0) + 1
 
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = abs(seqA[i - 1] - seqB[j - 1])
-            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    def pct(count: int) -> float:
+        return (count / total * 100.0) if total else 0.0
 
-    path = []
-    i, j = n, m
-    while i > 0 and j > 0:
-        path.append((i - 1, j - 1))
-        step = np.argmin([D[i - 1, j], D[i, j - 1], D[i - 1, j - 1]])
-        if step == 0:
-            i -= 1
-        elif step == 1:
-            j -= 1
-        else:
-            i -= 1
-            j -= 1
-    return path[::-1]
+    overall = int(round(pct(counts["good"])))
+    return {
+        "overallScore": overall,
+        "goodPercent": round(pct(counts["good"]), 1),
+        "moderatePercent": round(pct(counts["moderate"]), 1),
+        "poorPercent": round(pct(counts["poor"]), 1),
+        "totalNotes": total,
+    }
 
 
-def compare_performances(pm_ref, pm_student):
-    notes_ref = merge_same_pitch_notes(extract_notes(pm_ref))
-    notes_stud = merge_same_pitch_notes(extract_notes(pm_student))
-
-    if not notes_ref or not notes_stud:
-        return {"error": "Not enough notes to compare"}
-
-    pitch_ref = [n["pitch"] for n in notes_ref]
-    pitch_stud = [n["pitch"] for n in notes_stud]
-
-    path = dtw_path_simple(pitch_ref, pitch_stud)
-
-    comparison_data = []
-
-    ref_map = {i: [] for i in range(len(notes_ref))}
-    for i, j in path:
-        ref_map[i].append(j)
-
-    for i in range(len(notes_ref)):
-        ref_note = notes_ref[i]
-        student_indices = ref_map[i]
-
-        if not student_indices:
-            comparison_data.append(
-                {
-                    "time": ref_note["start"],
-                    "master": ref_note["pitch"],
-                    "user": None,
-                    "accuracy": "poor",
-                    "status": "missed_note",
-                }
-            )
-        else:
-            j_best = int(np.median(student_indices))
-            stud_note = notes_stud[j_best]
-
-            diff = stud_note["pitch"] - ref_note["pitch"]
-            abs_diff = abs(diff)
-
-            status = "good"
-            if abs_diff == 0:
-                status = "good"
-            elif abs_diff <= 2:
-                status = "moderate"
-            else:
-                status = "poor"
-
-            comparison_data.append(
-                {
-                    "time": ref_note["start"],
-                    "master": ref_note["pitch"],
-                    "user": stud_note["pitch"],
-                    "accuracy": status,
-                    "status": "match" if status == "good" else "wrong_pitch",
-                }
-            )
-
-    return comparison_data
-
-
-# --- 4. API Endpoints ---
+def _serialize_error_report(report: Sequence[NoteError]) -> List[Dict[str, Any]]:
+    return [error.to_dict() for error in report]
 
 
 @app.post("/analyze")
 async def analyze_performance(
     student_file: UploadFile = File(...),
     master_file: UploadFile = File(...),
-):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        t_dir = Path(temp_dir)
+) -> Dict[str, Any]:
+    """Analyze two uploaded performances and return chart-friendly data."""
 
-        stud_path = t_dir / student_file.filename
-        with stud_path.open("wb") as f:
-            f.write(await student_file.read())
+    async with analysis_lock:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            student_path = await _save_upload(student_file, tmpdir, "student")
+            master_path = await _save_upload(master_file, tmpdir, "master")
 
-        if stud_path.suffix.lower() in [".mid", ".midi"]:
-            pm_student = pretty_midi.PrettyMIDI(str(stud_path))
-        else:
-            pm_student = transcribe_audio(stud_path)
+            try:
+                student_midi = _ensure_midi_file(student_path, "student")
+                master_midi = _ensure_midi_file(master_path, "master")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        pm_student = align_midi_start(pm_student)
+            try:
+                comparison = compare_performances(master_midi, student_midi, config=comparison_config)
+            except Exception as exc:
+                logger.exception("Comparison failed")
+                raise HTTPException(status_code=500, detail=f"Comparison failed: {exc}") from exc
 
-        mast_path = t_dir / master_file.filename
-        with mast_path.open("wb") as f:
-            f.write(await master_file.read())
+            chart_data = _chart_data_from_result(comparison)
+            stats = _stats_from_chart(chart_data)
+            error_report = _serialize_error_report(comparison.error_report)
 
-        if mast_path.suffix.lower() in [".mid", ".midi"]:
-            pm_master = pretty_midi.PrettyMIDI(str(mast_path))
-        else:
-            pm_master = transcribe_audio(mast_path)
-
-        pm_master = align_midi_start(pm_master)
-
-        chart_data = compare_performances(pm_master, pm_student)
-
-        if isinstance(chart_data, dict) and chart_data.get("error"):
-            raise HTTPException(status_code=400, detail=chart_data["error"])
-
-        total = len(chart_data)
-        good = len([x for x in chart_data if x["accuracy"] == "good"])
-        moderate = len([x for x in chart_data if x["accuracy"] == "moderate"])
-        poor = len([x for x in chart_data if x["accuracy"] == "poor"])
-
-        score = int((good / total) * 100) if total > 0 else 0
-
-        stats = {
-            "overallScore": score,
-            "goodPercent": f"{(good / total) * 100:.1f}" if total else "0",
-            "moderatePercent": f"{(moderate / total) * 100:.1f}" if total else "0",
-            "poorPercent": f"{(poor / total) * 100:.1f}" if total else "0",
-        }
-
-        return {"stats": stats, "chartData": chart_data}
+            return {
+                "chartData": chart_data,
+                "stats": stats,
+                "errorReport": error_report,
+            }
 
 
 @app.get("/")
-def health_check():
-    return {"status": "healthy", "gpu": torch.cuda.is_available()}
+def health_check() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "modelLoaded": transcription_model is not None,
+    }
