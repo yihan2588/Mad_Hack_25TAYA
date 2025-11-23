@@ -1,21 +1,15 @@
-import json
+import google.generativeai as genai
+import os
 
-def generate_ai_feedback(diffJson):
-    """
-    Placeholder AI feedback — replace with Gemini/OpenAI call later.
-    """
-    try:
-        data = json.loads(diffJson)
-    except:
-        return "Unable to parse diffJson."
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-    stats = data.get("stats", {})
+def generate_feedback(diff_json: str) -> str:
+    model = genai.GenerativeModel("gemini-1.5-pro")
+    prompt = f"""
+You are a violin instructor. Analyze the following MIDI comparison data and provide
+detailed practice suggestions. Here is the data:
 
-    response = "🎻 **Violon AI Feedback**\n\n"
-    response += f"• Overall Score: {stats.get('overallScore', 'N/A')}%\n"
-    response += f"• Excellent: {stats.get('goodPercent', 'N/A')}%\n"
-    response += f"• Moderate: {stats.get('moderatePercent', 'N/A')}%\n"
-    response += f"• Needs Work: {stats.get('poorPercent', 'N/A')}%\n\n"
-    response += "Focus practice on red-highlighted regions where timing or pitch deviates most."
-
-    return response
+{diff_json}
+"""
+    response = model.generate_content(prompt)
+    return response.text
