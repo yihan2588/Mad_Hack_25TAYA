@@ -1,5 +1,8 @@
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
 pretty_midi
 numpy
+torch
+musc==0.0.1         # or your fork
+google-generativeai
+python-multipart
