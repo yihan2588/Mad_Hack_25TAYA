@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { analyzePerformanceWithLLM } from "./ai";
+import { compareMidiFiles } from "./backend";
 import {
   LineChart,
   Line,
@@ -55,6 +56,126 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
+const accuracyBucket = (label) => {
+  if (label === "good") return "good";
+  if (label === "moderate") return "moderate";
+  return "poor";
+};
+
+const accuracyFromEvaluation = (evaluation) => {
+  if (!evaluation) return "missing";
+  if (evaluation.student_error_type === "ok") return "good";
+  if (evaluation.student_error_type === "wrong_duration") return "moderate";
+  return "poor";
+};
+
+const buildRegionsFromChart = (chartEntries) => {
+  if (!chartEntries?.length) return [];
+  const regions = [];
+  chartEntries.forEach((entry, index) => {
+    const bucket = accuracyBucket(entry.accuracy);
+    if (!regions.length || regions[regions.length - 1].accuracy !== bucket) {
+      regions.push({ start: index, end: index, accuracy: bucket });
+    } else {
+      regions[regions.length - 1].end = index;
+    }
+  });
+  return regions;
+};
+
+const calculateStatsFromRegions = (regions) => {
+  if (!regions.length) return null;
+  const total = regions.reduce((sum, r) => sum + (r.end - r.start + 1), 0);
+  if (!total) return null;
+  const countByAccuracy = regions.reduce(
+    (acc, region) => {
+      acc[region.accuracy] = (acc[region.accuracy] || 0) + (region.end - region.start + 1);
+      return acc;
+    },
+    { good: 0, moderate: 0, poor: 0 }
+  );
+
+  const pct = (count) => ((count / total) * 100).toFixed(1);
+  return {
+    goodPercent: pct(countByAccuracy.good || 0),
+    moderatePercent: pct(countByAccuracy.moderate || 0),
+    poorPercent: pct(countByAccuracy.poor || 0),
+    overallScore: ((countByAccuracy.good || 0) / total * 100).toFixed(0),
+  };
+};
+
+const buildDiffRows = (result) => {
+  const rows = (result?.error_report || []).map((entry, index) => {
+    const masterPitch = entry.gt_pitch;
+    const studentPitch = entry.student_pitch;
+    const pitchDelta =
+      typeof studentPitch === "number" && typeof masterPitch === "number"
+        ? Number((studentPitch - masterPitch).toFixed(2))
+        : null;
+
+    return {
+      index,
+      approxTimeMs: Math.round((entry.time_sec || 0) * 1000),
+      masterPitch,
+      masterNote: typeof masterPitch === "number" ? midiToNote(masterPitch) : null,
+      userPitch: studentPitch,
+      userNote: typeof studentPitch === "number" ? midiToNote(studentPitch) : null,
+      pitchDelta,
+      accuracy: entry.student_error_type,
+      onsetDiffSec: entry.onset_diff_sec ?? null,
+      offsetDiffSec: entry.offset_diff_sec ?? null,
+    };
+  });
+  return rows;
+};
+
+const buildChartDataFromResult = (result) => {
+  const refNotes = result?.reference_notes || [];
+  const studentNotes = result?.student_notes_warped || [];
+  const evalByRef = new Map();
+  (result?.match_evaluations || []).forEach((evaluation) => {
+    evalByRef.set(evaluation.reference_index, evaluation);
+  });
+
+  const chart = refNotes.map((note, index) => {
+    const evaluation = evalByRef.get(index);
+    const studentNote = evaluation ? studentNotes[evaluation.student_index] : null;
+
+    return {
+      time: note.start,
+      master: note.pitch,
+      user: studentNote?.pitch ?? null,
+      accuracy: evaluation ? accuracyFromEvaluation(evaluation) : "poor",
+    };
+  });
+
+  (result?.extra_student_indices || []).forEach((studentIndex) => {
+    const note = studentNotes[studentIndex];
+    if (!note) return;
+    chart.push({
+      time: note.start,
+      master: null,
+      user: note.pitch,
+      accuracy: "poor",
+    });
+  });
+
+  chart.sort((a, b) => a.time - b.time);
+  return chart;
+};
+
+const deriveVisualizationState = (result) => {
+  if (!result) {
+    return { chartData: [], accuracyRegions: [], stats: null, diffRows: [] };
+  }
+
+  const chartData = buildChartDataFromResult(result);
+  const accuracyRegions = buildRegionsFromChart(chartData);
+  const stats = calculateStatsFromRegions(accuracyRegions);
+  const diffRows = buildDiffRows(result);
+  return { chartData, accuracyRegions, stats, diffRows };
+};
+
 const ViolonApp = () => {
   const [userFile, setUserFile] = useState(null);
   const [masterFile, setMasterFile] = useState(null);
@@ -65,69 +186,9 @@ const ViolonApp = () => {
   const [aiFeedback, setAiFeedback] = useState("");
   const [aiError, setAiError] = useState(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
 
-  const parseMidiFile = React.useCallback((file) => {
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const data = new Uint8Array(e.target.result);
-        const notes = extractNotesFromMidi(data);
-        resolve(notes);
-      };
-      reader.readAsArrayBuffer(file);
-    });
-  }, []);
-
-  const extractNotesFromMidi = (data) => {
-    const notes = [];
-    let time = 0;
-
-    for (let i = 0; i < data.length - 2; i++) {
-      if ((data[i] & 0xf0) === 0x90 && data[i + 2] > 0) {
-        const pitch = data[i + 1];
-        notes.push({ time: time, pitch: pitch });
-        time += 100;
-      }
-    }
-
-    if (notes.length === 0) {
-      for (let i = 0; i < 50; i++) {
-        notes.push({
-          time: i * 100,
-          pitch: 60 + Math.sin(i * 0.3) * 10 + Math.random() * 3,
-        });
-      }
-    }
-
-    return notes;
-  };
-
-  const calculateAccuracy = (userPitch, masterPitch) => {
-    const diff = Math.abs(userPitch - masterPitch);
-    if (diff < 1.5) return "good";
-    if (diff < 4) return "moderate";
-    return "poor";
-  };
-
-  const calculateStats = (regions) => {
-    const total = regions.reduce((sum, r) => sum + (r.end - r.start + 1), 0);
-    const good = regions
-      .filter((r) => r.accuracy === "good")
-      .reduce((sum, r) => sum + (r.end - r.start + 1), 0);
-    const moderate = regions
-      .filter((r) => r.accuracy === "moderate")
-      .reduce((sum, r) => sum + (r.end - r.start + 1), 0);
-    const poor = regions
-      .filter((r) => r.accuracy === "poor")
-      .reduce((sum, r) => sum + (r.end - r.start + 1), 0);
-
-    return {
-      goodPercent: ((good / total) * 100).toFixed(1),
-      moderatePercent: ((moderate / total) * 100).toFixed(1),
-      poorPercent: ((poor / total) * 100).toFixed(1),
-      overallScore: ((good / total) * 100).toFixed(0),
-    };
-  };
 
   const generateAiFeedback = React.useCallback(async (diffJson) => {
     if (!diffJson) {
@@ -157,62 +218,37 @@ const ViolonApp = () => {
   const processFiles = React.useCallback(async () => {
     if (!userFile || !masterFile) return;
 
-    const userNotes = await parseMidiFile(userFile);
-    const masterNotes = await parseMidiFile(masterFile);
+    setAnalysisLoading(true);
+    setAnalysisError(null);
 
-    const maxLength = Math.max(userNotes.length, masterNotes.length);
-    const data = [];
-    const regions = [];
-    const diffRows = [];
-
-    for (let i = 0; i < maxLength; i++) {
-      const userPitch =
-        userNotes[i]?.pitch || userNotes[userNotes.length - 1]?.pitch || 60;
-      const masterPitch =
-        masterNotes[i]?.pitch ||
-        masterNotes[masterNotes.length - 1]?.pitch ||
-        60;
-
-      data.push({
-        time: i,
-        user: userPitch,
-        master: masterPitch,
+    try {
+      const apiResult = await compareMidiFiles({
+        referenceFile: masterFile,
+        studentFile: userFile,
       });
 
-      const accuracy = calculateAccuracy(userPitch, masterPitch);
+      const { chartData: chart, accuracyRegions: regions, stats: derivedStats, diffRows } =
+        deriveVisualizationState(apiResult);
 
-      if (
-        regions.length === 0 ||
-        regions[regions.length - 1].accuracy !== accuracy
-      ) {
-        regions.push({
-          start: i,
-          end: i,
-          accuracy: accuracy,
-        });
-      } else {
-        regions[regions.length - 1].end = i;
-      }
+      setChartData(chart);
+      setAccuracyRegions(regions);
+      setStats(derivedStats);
 
-      diffRows.push({
-        index: i,
-        approxTimeMs: userNotes[i]?.time ?? i * 100,
-        masterPitch,
-        masterNote: midiToNote(masterPitch),
-        userPitch,
-        userNote: midiToNote(userPitch),
-        pitchDelta: Number((userPitch - masterPitch).toFixed(2)),
-        accuracy,
-      });
+      const diffJsonPayload = buildDiffPayload(derivedStats, regions, diffRows);
+      generateAiFeedback(diffJsonPayload);
+    } catch (error) {
+      console.error("Comparison error:", error);
+      setAnalysisError(
+        error?.message || "Unable to analyze the uploaded MIDI files right now."
+      );
+      setChartData([]);
+      setAccuracyRegions([]);
+      setStats(null);
+      setAiFeedback("");
+    } finally {
+      setAnalysisLoading(false);
     }
-
-    setChartData(data);
-    setAccuracyRegions(regions);
-    const derivedStats = calculateStats(regions);
-    setStats(derivedStats);
-    const diffJsonPayload = buildDiffPayload(derivedStats, regions, diffRows);
-    generateAiFeedback(diffJsonPayload);
-  }, [userFile, masterFile, generateAiFeedback, parseMidiFile]);
+  }, [userFile, masterFile, generateAiFeedback]);
 
   const handleUserFileChange = (e) => {
     const file = e.target.files[0];
@@ -237,6 +273,10 @@ const ViolonApp = () => {
       setAiFeedback("");
       setAiError(null);
       setAiLoading(false);
+      setAnalysisError(null);
+      setChartData([]);
+      setAccuracyRegions([]);
+      setStats(null);
     }
   }, [userFile, masterFile]);
 
@@ -431,6 +471,19 @@ const ViolonApp = () => {
         </div>
 
         {/* Stats Cards */}
+        {analysisLoading && (
+          <div className="bg-white/10 backdrop-blur-xl rounded-2xl shadow-2xl p-6 border border-white/30 text-center text-white mb-6">
+            <p className="text-lg font-semibold">Analyzing your performance...</p>
+            <p className="text-sm text-purple-100 mt-2">This may take a few seconds depending on file size.</p>
+          </div>
+        )}
+
+        {analysisError && (
+          <div className="bg-red-500/20 backdrop-blur-xl rounded-2xl shadow-2xl p-4 border border-red-400/40 text-white mb-6">
+            <p className="font-semibold">{analysisError}</p>
+          </div>
+        )}
+
         {stats && (
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
             <div className="bg-gradient-to-br from-green-500/20 to-green-600/20 backdrop-blur-xl rounded-2xl p-6 border border-green-400/30">
@@ -575,15 +628,19 @@ const ViolonApp = () => {
                     }}
                   />
 
-                  {accuracyRegions.map((region, idx) => (
-                    <ReferenceArea
-                      key={idx}
-                      x1={region.start}
-                      x2={region.end}
-                      fill={getColorForAccuracy(region.accuracy)}
-                      fillOpacity={1}
-                    />
-                  ))}
+                  {accuracyRegions.map((region, idx) => {
+                    const startTime = chartData[region.start]?.time ?? 0;
+                    const endTime = chartData[region.end]?.time ?? startTime;
+                    return (
+                      <ReferenceArea
+                        key={idx}
+                        x1={startTime}
+                        x2={endTime}
+                        fill={getColorForAccuracy(region.accuracy)}
+                        fillOpacity={1}
+                      />
+                    );
+                  })}
 
                   <Line
                     type="monotone"

@@ -1,0 +1,6 @@
+fastapi>=0.109
+uvicorn[standard]>=0.27
+numpy>=1.26
+pandas>=2.2
+pretty_midi>=0.2
+matplotlib>=3.8
