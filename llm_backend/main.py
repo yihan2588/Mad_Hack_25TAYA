@@ -1,57 +1,101 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import tempfile
-import os
+import shutil
+from pathlib import Path
 
-from utils_midi import run_midi_comparison
-from ai_feedback import generate_ai_feedback
+from utils_midi import (
+    load_transcription_model,
+    transcribe_audio_files,
+    compare_performances,
+)
 
-app = FastAPI()
+app = FastAPI(title="Violin Backend")
 
-# Enable CORS so frontend can call this API
+# Allow CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development, can restrict later
+    allow_origins=["*"],   # You can restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class LLMRequest(BaseModel):
-    diffJson: str
-
-
+# ------------------------------
+# HEALTH CHECK
+# ------------------------------
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
-# === MIDI Comparison Endpoint ===
+# ---------------------------------------------------
+# 1) API: Compare two MIDI files
+#    route: POST /api/compare-midi
+# ---------------------------------------------------
 @app.post("/api/compare-midi")
-async def compare_midi(referenceFile: UploadFile = File(...),
-                       studentFile: UploadFile = File(...)):
+async def compare_midi(referenceFile: UploadFile = File(...), studentFile: UploadFile = File(...)):
 
-    # Save uploaded files to temporary directory
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ref_path = os.path.join(tmpdir, "reference.mid")
-        stu_path = os.path.join(tmpdir, "student.mid")
+    try:
+        # Save temp files
+        ref_tmp = Path(tempfile.mktemp(suffix=".mid"))
+        stu_tmp = Path(tempfile.mktemp(suffix=".mid"))
 
-        with open(ref_path, "wb") as f:
-            f.write(await referenceFile.read())
+        with ref_tmp.open("wb") as f:
+            shutil.copyfileobj(referenceFile.file, f)
 
-        with open(stu_path, "wb") as f:
-            f.write(await studentFile.read())
+        with stu_tmp.open("wb") as f:
+            shutil.copyfileobj(studentFile.file, f)
 
-        # Compute comparison
-        result = run_midi_comparison(ref_path, stu_path)
+        # Run comparison
+        result = compare_performances(ref_tmp, stu_tmp)
 
-        return result
+        return result.to_json()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# === LLM Feedback API ===
+# ---------------------------------------------------
+# 2) API: Transcribe audio (m4a → wav → midi)
+#    route: POST /api/transcribe
+# ---------------------------------------------------
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    try:
+        # Save incoming audio
+        audio_tmp = Path(tempfile.mktemp(suffix=".m4a"))
+        with audio_tmp.open("wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        # Load MUSC model (slow the first time)
+        model = load_transcription_model("violin")
+
+        # Transcribe into MIDI
+        midi_paths = transcribe_audio_files([audio_tmp], model)
+
+        with open(midi_paths[0], "rb") as f:
+            midi_data = f.read()
+
+        return {
+            "midi_base64": midi_data.hex()
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------
+# 3) API: AI Feedback
+#    route: POST /api/llm-feedback
+# ---------------------------------------------------
+from ai_feedback import generate_feedback  # your Gemini/OpenAI wrapper
+
 @app.post("/api/llm-feedback")
-async def llm_feedback(req: LLMRequest):
-    feedback = generate_ai_feedback(req.diffJson)
-    return {"feedback": feedback}
-
+async def llm_feedback(payload: dict):
+    try:
+        diff_json = payload.get("diffJson")
+        result = generate_feedback(diff_json)
+        return {"feedback": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
