@@ -271,17 +271,17 @@ midi_A_path, midi_B_path = get_two_midi_paths()
 # ============================================================
 # PARAMETERS (tuned to suppress split/merge noise)
 # ============================================================
-merge_gap      = 0.3   # sec: merge same-pitch notes if gap <= 80 ms
+merge_gap      = 0.3   # sec: merge same-pitch notes
 min_note_dur   = 0.3   # sec: ignore tiny spurious notes
 
 # loose pairing AFTER DTW warping
 match_time_tol = 0.3   # sec: tolerant to small early/late
-match_pitch_tol = 0.5   # semitones: keep strict to avoid wrong pairing
+match_pitch_tol = 1   # semitones: keep strict to avoid wrong pairing
 
 # "significant / way-off" thresholds
-sig_onset_tol  = 0.3   # sec: only flag big rhythm errors
-sig_pitch_tol  = 3    # semitones: 1 MIDI step = wrong note
-sig_offset_tol = 0.3   # sec: very forgiving on duration differences
+sig_onset_tol  = 0.5   # sec: only flag big rhythm errors
+sig_pitch_tol  = 5    # semitones: 1 MIDI step = wrong note
+sig_offset_tol = 0.5   # sec: very forgiving on duration differences
 
 
 # ============================================================
