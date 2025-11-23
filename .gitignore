@@ -22,3 +22,43 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python/
+
+# Library artifacts
+*.lib
+*.a
+*.so
+*.dll
+
+# Model caches
+*.vinf
+*.pth
+*.bin
+*.npz
+*.npy
+*.pkl
+
+# Colab / notebook junk
+*.ipynb_checkpoints/
+.cache/
+*.swp
+*.tmp
+
+# OS specific
+Thumbs.db
+
+# Build / dist
+dist/
+*.egg-info/

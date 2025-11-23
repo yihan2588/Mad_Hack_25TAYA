@@ -13,8 +13,8 @@ export const compareMidiFiles = async ({ referenceFile, studentFile }) => {
   }
 
   const formData = new FormData();
-  formData.append("reference_midi", referenceFile);
-  formData.append("student_midi", studentFile);
+  formData.append("reference_audio", referenceFile);
+  formData.append("student_audio", studentFile);
 
   const response = await fetch(buildUrl("/api/compare"), {
     method: "POST",

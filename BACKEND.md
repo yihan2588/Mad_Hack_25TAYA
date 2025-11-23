@@ -1,7 +1,7 @@
 # Backend MIDI Comparison Module
 
 The `yata_team.py` module now exposes importable functions so the frontend (or a
-future service layer) can drive MIDI transcription and comparison without
+future service layer) can drive audio→MIDI transcription and comparison without
 depending on the Colab notebook.
 
 ## Quick start
@@ -58,17 +58,28 @@ fast passages or to loosen duration matching).
 ## Running the backend API
 
 The React frontend expects a REST endpoint at `/api/compare` that accepts two
-MIDI uploads and returns the JSON payload produced by
-`compare_performances`. A FastAPI server is provided in `backend_server.py`.
+uploads (either audio `.m4a/.wav` or `.mid` files). The backend converts audio
+to WAV, runs the MUSC transcription model, and then calls
+`compare_performances`.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-# ensure MUSC violin dependencies are installed if you need transcription
-uvicorn backend_server:app --reload
+# one-time setup (installs venv, ffmpeg check, MUSC repo, deps)
+./scripts/setup_backend.sh
+
+# start the API (uses the venv automatically)
+./scripts/run_backend.sh
 ```
 
 During development the React app proxies requests to
 `http://localhost:8000`, so the frontend will automatically talk to the local
 FastAPI process once it is running.
+
+### Transcription requirements
+
+- `scripts/setup_backend.sh` checks for `ffmpeg` on PATH; install it (e.g., with
+  Homebrew on macOS) before running the script.
+- The script clones the MUSC violin transcription repo
+  (https://github.com/MTG/violin-transcription), installs its Python requirements,
+  and writes a `.pth` entry so `import musc` resolves to that checkout.
+- PyTorch + (optionally) CUDA drivers are required for the MUSC model. On CPU
+  the transcription step will run but may take significantly longer.
