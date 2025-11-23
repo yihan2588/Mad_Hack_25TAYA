@@ -1,8 +1,6 @@
-// backend.js
 export const API_BASE_URL =
   process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
 
-// Compare MIDI files
 export async function compareMidiFiles({ referenceFile, studentFile }) {
   const formData = new FormData();
   formData.append("referenceFile", referenceFile);
@@ -20,7 +18,6 @@ export async function compareMidiFiles({ referenceFile, studentFile }) {
   return await res.json();
 }
 
-// Get AI feedback
 export async function analyzePerformanceWithLLM({ diffJson }) {
   const res = await fetch(`${API_BASE_URL}/api/llm-feedback`, {
     method: "POST",
