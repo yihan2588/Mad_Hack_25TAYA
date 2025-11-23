@@ -7,15 +7,28 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import gradio as gr
 
+# Import AI analyzer
+try:
+    from ai_analyzer import analyze_performance_with_ai
+    AI_ENABLED = True
+except ImportError:
+    AI_ENABLED = False
+    print("[WARNING] AI analyzer not available. Install google-generativeai to enable AI features.")
+
 # ---- ZeroGPU-compatible import ----
 try:
     import spaces
 except ImportError:
     class _DummySpaces:
-        def GPU(self, *args, **kwargs):
-            def deco(fn):
-                return fn
-            return deco
+        @staticmethod
+        def GPU(fn=None, **outer_kwargs):
+            def decorator(func):
+                def wrapper(*args, **kwargs):
+                    return func(*args, **kwargs)
+                return wrapper
+            if fn is None:
+                return decorator
+            return decorator(fn)
     spaces = _DummySpaces()
 # -----------------------------------
 
@@ -34,25 +47,65 @@ _DEVICE: Optional[str] = None
 
 APP_CSS = """
 /* ===== Basic Color System (neutral, high contrast) ===== */
-:root{
-  --bg-page: #f3f4f6;        /* light gray background */
-  --surface: #ffffff;        /* card background */
-  --border: #e5e7eb;         /* light border */
-  --text-main: #111827;      /* main dark text */
-  --text-muted: #4b5563;     /* muted gray text */
-  --accent: #2563eb;         /* button blue */
+/* ===== Theme-aware Color System ===== */
+:root, [data-theme="light"] {
+ --bg-page: #f3f4f6;
+ --surface: #ffffff;
+ --glass: rgba(255, 255, 255, 0.85);
+ --glass-strong: rgba(255, 255, 255, 0.92);
+ --border: #e5e7eb;
+ --text-main: #111827;
+ --text: #111827;
+ --text-muted: #4b5563;
+ --muted: #4b5563;
+ --accent: #2563eb;
+ --accent-1: #6d8bff;
+ --accent-3: #a78bfa;
+ --good: rgba(16, 185, 129, 0.15);
+ --good-bg: #ecfdf3;
+ --good-border: #bbf7d0;
+ --good-text: #166534;
+ --moderate: rgba(234, 179, 8, 0.15);
+ --mod-bg: #fffbeb;
+ --mod-border: #facc15;
+ --mod-text: #92400e;
+ --poor: rgba(244, 63, 94, 0.15);
+ --poor-bg: #fef2f2;
+ --poor-border: #fecaca;
+ --poor-text: #b91c1c;
+ --tip-bg: #0f172a;
+ --tip-fg: #f8fafc;
+}
 
-  --good-bg: #ecfdf3;
-  --good-border: #bbf7d0;
-  --good-text: #166534;
 
-  --mod-bg: #fffbeb;
-  --mod-border: #facc15;
-  --mod-text: #92400e;
-
-  --poor-bg: #fef2f2;
-  --poor-border: #fecaca;
-  --poor-text: #b91c1c;
+/* Dark mode colors */
+[data-theme="dark"], .dark {
+ --bg-page: #0f172a;
+ --surface: #1e293b;
+ --glass: rgba(30, 41, 59, 0.85);
+ --glass-strong: rgba(30, 41, 59, 0.92);
+ --border: #334155;
+ --text-main: #f1f5f9;
+ --text: #f1f5f9;
+ --text-muted: #cbd5e1;
+ --muted: #cbd5e1;
+ --accent: #3b82f6;
+ --accent-1: #818cf8;
+ --accent-3: #c084fc;
+ --good: rgba(34, 197, 94, 0.2);
+ --good-bg: rgba(34, 197, 94, 0.1);
+ --good-border: rgba(34, 197, 94, 0.3);
+ --good-text: #86efac;
+ --moderate: rgba(234, 179, 8, 0.2);
+ --mod-bg: rgba(234, 179, 8, 0.1);
+ --mod-border: rgba(234, 179, 8, 0.3);
+ --mod-text: #fde047;
+ --poor: rgba(239, 68, 68, 0.2);
+ --poor-bg: rgba(239, 68, 68, 0.1);
+ --poor-border: rgba(239, 68, 68, 0.3);
+ --poor-text: #fca5a5;
+ --tip-bg: #f8fafc;
+ --tip-fg: #0f172a;
 }
 
 body {
@@ -543,7 +596,8 @@ with gr.Blocks(title="YATA Violin Comparator", css=APP_CSS, theme=theme) as demo
             )
             reference_in = gr.File(
                 label="",
-                file_types=[".mid", ".midi", ".m4a", ".wav", ".mp3", ".flac", ".aac", ".ogg"],
+                file_types=[".mid", ".midi", ".m4a", ".wav",
+                            ".mp3", ".flac", ".aac", ".ogg"],
                 type="filepath",
                 elem_classes=["yata-file-input"],
             )
@@ -563,7 +617,8 @@ with gr.Blocks(title="YATA Violin Comparator", css=APP_CSS, theme=theme) as demo
             )
             student_in = gr.File(
                 label="",
-                file_types=[".mid", ".midi", ".m4a", ".wav", ".mp3", ".flac", ".aac", ".ogg"],
+                file_types=[".mid", ".midi", ".m4a", ".wav",
+                            ".mp3", ".flac", ".aac", ".ogg"],
                 type="filepath",
                 elem_classes=["yata-file-input"],
             )
@@ -580,33 +635,88 @@ with gr.Blocks(title="YATA Violin Comparator", css=APP_CSS, theme=theme) as demo
         run_btn = gr.Button("Analyze Performance", variant="primary")
 
     stats_out = gr.HTML(elem_id="stats_output")
-    summary_out = gr.Markdown(elem_classes=["yata-panel", "yata-panel-light", "yata-markdown"])
+    summary_out = gr.Markdown(
+        elem_classes=["yata-panel", "yata-panel-light", "yata-markdown"])
 
     with gr.Accordion("Comparison settings", open=False):
-        merge_gap = gr.Slider(0.0, 1.0, value=0.3, step=0.01, label="Merge gap (sec)")
-        min_note_duration = gr.Slider(0.0, 1.0, value=0.3, step=0.01, label="Min note duration (sec)")
-        match_time_tol = gr.Slider(0.0, 1.0, value=0.3, step=0.01, label="Match time tolerance (sec)")
-        match_pitch_tol = gr.Slider(0, 12, value=1, step=1, label="Match pitch tolerance (semitones)")
-        sig_onset_tol = gr.Slider(0.0, 2.0, value=0.3, step=0.01, label="Significant onset tolerance (sec)")
-        sig_pitch_tol = gr.Slider(0, 24, value=1, step=1, label="Significant pitch tolerance (semitones)")
-        sig_offset_tol = gr.Slider(0.0, 2.0, value=0.3, step=0.01, label="Significant offset tolerance (sec)")
+        merge_gap = gr.Slider(0.0, 1.0, value=0.3,
+                              step=0.01, label="Merge gap (sec)")
+        min_note_duration = gr.Slider(
+            0.0, 1.0, value=0.3, step=0.01, label="Min note duration (sec)")
+        match_time_tol = gr.Slider(
+            0.0, 1.0, value=0.3, step=0.01, label="Match time tolerance (sec)")
+        match_pitch_tol = gr.Slider(
+            0, 12, value=1, step=1, label="Match pitch tolerance (semitones)")
+        sig_onset_tol = gr.Slider(
+            0.0, 2.0, value=0.3, step=0.01, label="Significant onset tolerance (sec)")
+        sig_pitch_tol = gr.Slider(
+            0, 24, value=1, step=1, label="Significant pitch tolerance (semitones)")
+        sig_offset_tol = gr.Slider(
+            0.0, 2.0, value=0.3, step=0.01, label="Significant offset tolerance (sec)")
 
     with gr.Accordion("Transcription settings (audio only)", open=False):
         batch_size = gr.Slider(1, 64, value=32, step=1, label="Batch size")
-        postprocessing = gr.Dropdown(choices=["spotify"], value="spotify", label="Postprocessing")
+        postprocessing = gr.Dropdown(
+            choices=["spotify"], value="spotify", label="Postprocessing")
 
-    plot_out = gr.Plot(label="Reference vs Student (warped)", elem_classes=["yata-panel"])
+    plot_out = gr.Plot(label="Reference vs Student (warped)",
+                       elem_classes=["yata-panel"])
     report_out = gr.JSON(
         label="Severe misalignment events (error_report)",
         elem_classes=["yata-panel", "yata-panel-light"],
     )
+    
+    # AI Analysis output (conditional on whether API key is available)
+    ai_analysis_out = gr.Markdown(
+        label="🤖 AI Coach Analysis",
+        elem_classes=["yata-panel", "yata-panel-light", "yata-markdown"],
+        visible=AI_ENABLED
+    ) if AI_ENABLED else None
 
     def _on_click(*args):
+        print("[LOG] _on_click: started")
+        print("[LOG] _on_click: starting compare_pipeline...")
         severe_dict, fig = run_compare_gpu(*args)
+        print("[LOG] _on_click: compare_pipeline finished")
         summary_md = make_summary(severe_dict)
         stats_html = render_stats_html(compute_frontend_stats(severe_dict))
-        return stats_html, summary_md, severe_dict.get("error_report", []), fig
+        error_report = severe_dict.get("error_report", [])
+        
+        # Generate AI analysis if available
+        ai_feedback = ""
+        if AI_ENABLED:
+            try:
+                print("[LOG] _on_click: starting AI analysis...")
+                ai_feedback = analyze_performance_with_ai({
+                    "summary": severe_dict.get("summary", {}),
+                    "error_report": error_report,
+                })
+                print("[LOG] _on_click: AI analysis finished")
+            except Exception as e:
+                print(f"[ERROR] _on_click: AI analysis failed: {e}")
+                ai_feedback = f"⚠️ AI analysis unavailable: {str(e)}"
+        
+        if AI_ENABLED:
+            return stats_html, summary_md, error_report, fig, ai_feedback
+        else:
+            return stats_html, summary_md, error_report, fig
 
+    outputs = [stats_out, summary_out, report_out, plot_out]
+    if AI_ENABLED:
+        outputs.append(ai_analysis_out)
+
+    # Quick UI feedback: show a loading placeholder immediately when Analyze is clicked.
+    def _show_loading():
+        loading_stats = "<div style='padding:1rem;'>analyzing... It might take a while</div>"
+        loading_summary = "**analyzing...**"
+        loading_report = {}
+        loading_plot = None
+        if AI_ENABLED:
+            loading_ai = "🤖 AI working hard, pls be patient..."
+            return loading_stats, loading_summary, loading_report, loading_plot, loading_ai
+        return loading_stats, loading_summary, loading_report, loading_plot
+    # Register a fast placeholder update first, then the heavy worker. Gradio will run callbacks in order.
+    run_btn.click(_show_loading, inputs=[], outputs=outputs)
     run_btn.click(
         _on_click,
         inputs=[
@@ -622,11 +732,13 @@ with gr.Blocks(title="YATA Violin Comparator", css=APP_CSS, theme=theme) as demo
             batch_size,
             postprocessing,
         ],
-        outputs=[stats_out, summary_out, report_out, plot_out],
+        outputs=outputs,
     )
 
-    reference_in.change(_audio_preview_value, inputs=reference_in, outputs=reference_preview)
-    student_in.change(_audio_preview_value, inputs=student_in, outputs=student_preview)
+    reference_in.change(_audio_preview_value,
+                        inputs=reference_in, outputs=reference_preview)
+    student_in.change(_audio_preview_value, inputs=student_in,
+                      outputs=student_preview)
 
     gr.Markdown(
         "**Tip:** We flag locally severe errors, not tiny accumulated drift.",

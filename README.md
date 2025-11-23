@@ -35,3 +35,10 @@ You can upload either:
 - Works on CPU.
 - ZeroGPU supported.
 - You can switch to paid GPU hardware in Space Settings for faster transcription.
+
+## Secrets / API keys
+
+The AI feedback feature pulls a Google Gemini API key from the environment. Keep it out of the repo:
+- Create a local `.env` (ignored by git) and set `GOOGLE_API_KEY=...` while developing.
+- On Hugging Face, open **Settings → Repository secrets**, add `GOOGLE_API_KEY` with the same value, and redeploy. The Space exposes it as an env var automatically.
+- Never commit `.env` or hard-code keys; the app already calls `os.getenv`/`load_dotenv` to pick it up automatically.
