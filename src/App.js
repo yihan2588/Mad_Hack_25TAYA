@@ -166,7 +166,8 @@ const ViolonApp = () => {
         return "transparent";
     }
   };
-return (
+
+  return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-800 to-pink-700 p-4 md:p-8">
       <div className="max-w-7xl mx-auto">
         {/* Header with floating animation */}
@@ -417,15 +418,18 @@ return (
                 <LineChart data={chartData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                   <XAxis
-                    dataKey="time"
-                    label={{
-                      value: "Time Progression",
-                      position: "insideBottom",
-                      offset: -5,
-                      style: { fill: "#374151", fontWeight: 600 },
-                    }}
-                    stroke="#6b7280"
-                  />
+		  dataKey="time"
+		  type="number"
+		  domain={["dataMin", "dataMax"]}
+		  label={{
+		    value: "Time Progression",
+		    position: "insideBottom",
+		    offset: -5,
+		    style: { fill: "#374151", fontWeight: 600 },
+		  }}
+		  stroke="#6b7280"
+		/>
+
                   <YAxis
                     label={{
                       value: "Pitch (MIDI Note)",
@@ -505,4 +509,5 @@ return (
     </div>
   );
 };
+
 export default ViolonApp;
